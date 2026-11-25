@@ -1,0 +1,131 @@
+# Sealed-build workflow: a GitHub Actions translation of upstream's
+# .circleci/config.yml (upstream ships no GitHub Actions build/test workflow).
+# Jobs mirror CircleCI's build (JDK 21 + GC tests), build-jdk11, build-jdk17,
+# concurrency-tests (jcstress) and docker-tests (dockerTest).
+name: Seal build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Gradle test task + filter to run instead of the full build, e.g. ":micrometer-core:test --tests FooTest"'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  GRADLE_OPTS: '-Dorg.gradle.jvmargs="-Xmx2048m -XX:+HeapDumpOnOutOfMemoryError"'
+  # Release coordinates (nebula-release would otherwise derive a SNAPSHOT from git),
+  # japicmp baseline download skipped, build scans and the remote build cache off so
+  # every test task really executes.
+  GRADLE_FLAGS: >-
+    --no-daemon --console=plain --stacktrace --no-scan --no-build-cache
+    -Prelease.version=1.13.6 -Prelease.stage=final -Prelease.disableGitChecks=true
+    -PcompatibleVersion=SKIP
+    -Porg.gradle.java.installations.fromEnv=JAVA_HOME_11_X64,JAVA_HOME_17_X64,JAVA_HOME_21_X64
+
+jobs:
+  build:
+    name: build (JDK ${{ matrix.jdk }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        jdk: [ '21', '11', '17' ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          # JDK 11 is the toolchain for micrometer-core's java11 multi-release source set;
+          # the last entry is the JDK that runs Gradle (CircleCI images: 21.0.2 / 11 / 17).
+          java-version: |
+            11
+            17
+            ${{ matrix.jdk == '21' && '21.0.2' || matrix.jdk }}
+          cache: gradle
+      - name: Write Gradle init script (gates off, test result logging)
+        run: bash .github/seal/seal-init.sh "$RUNNER_TEMP/seal-init.gradle"
+      - name: Build and test
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew $GRADLE_FLAGS -I "$RUNNER_TEMP/seal-init.gradle" :micrometer-core:jar ${{ inputs.test-filter }}
+          else
+            ./gradlew $GRADLE_FLAGS -I "$RUNNER_TEMP/seal-init.gradle" build
+          fi
+      - name: GC tests (shenandoahTest, zgcTest, zgcGenerationalTest)
+        if: matrix.jdk == '21' && inputs.test-filter == ''
+        run: |
+          ./gradlew $GRADLE_FLAGS -I "$RUNNER_TEMP/seal-init.gradle" shenandoahTest
+          ./gradlew $GRADLE_FLAGS -I "$RUNNER_TEMP/seal-init.gradle" zgcTest
+          ./gradlew $GRADLE_FLAGS -I "$RUNNER_TEMP/seal-init.gradle" zgcGenerationalTest
+      - name: Upload micrometer-core jar
+        if: matrix.jdk == '21'
+        uses: actions/upload-artifact@v4
+        with:
+          name: micrometer-core-jar
+          path: micrometer-core/build/libs/micrometer-core-1.13.6.jar
+          if-no-files-found: error
+      - name: Test summary and skipped-test report
+        if: always()
+        run: python3 .github/seal/seal-test-report.py
+
+  concurrency-tests:
+    if: inputs.test-filter == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: |
+            11
+            17
+            21.0.2
+          cache: gradle
+      - name: Write Gradle init script (gates off, test result logging)
+        run: bash .github/seal/seal-init.sh "$RUNNER_TEMP/seal-init.gradle"
+      - name: jcstress
+        run: ./gradlew $GRADLE_FLAGS -I "$RUNNER_TEMP/seal-init.gradle" jcstress
+
+  docker-tests:
+    if: inputs.test-filter == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: |
+            11
+            17
+            21.0.2
+          cache: gradle
+      - name: Allow Testcontainers' Docker API version
+        # Testcontainers 1.19.8 speaks Docker API 1.32; the runner's Docker 29 daemon
+        # rejects anything below 1.44 unless the minimum is lowered.
+        run: |
+          sudo mkdir -p /etc/systemd/system/docker.service.d
+          printf '[Service]\nEnvironment=DOCKER_MIN_API_VERSION=1.24\n' | sudo tee /etc/systemd/system/docker.service.d/min-api.conf
+          sudo systemctl daemon-reload
+          sudo systemctl restart docker
+          docker version
+      - name: Pin prom/prometheus:latest to the 2.x line the 1.13.6 tests assert
+        # PrometheusMeterRegistryIntegrationTest runs prom/prometheus:latest and asserts
+        # build-info version "2.*"; latest is 3.x today, so pre-load the release-era
+        # v2.54.1 under the latest tag (Testcontainers uses a locally present image).
+        run: |
+          docker pull prom/prometheus:v2.54.1
+          docker tag prom/prometheus:v2.54.1 prom/prometheus:latest
+      - name: Write Gradle init script (gates off, test result logging)
+        run: bash .github/seal/seal-init.sh "$RUNNER_TEMP/seal-init.gradle"
+      - name: dockerTest
+        run: ./gradlew $GRADLE_FLAGS -I "$RUNNER_TEMP/seal-init.gradle" dockerTest
+      - name: Test summary and skipped-test report
+        if: always()
+        run: python3 .github/seal/seal-test-report.py
